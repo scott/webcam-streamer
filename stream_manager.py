@@ -2,6 +2,10 @@
 """
 Live Stream Switcher
 Cycles through YouTube live camera streams with seamless switching.
+
+Uses a single persistent ffmpeg process reading from a named pipe (FIFO).
+Camera switches are done by swapping which yt-dlp process writes to the pipe.
+This keeps the output stream (HLS preview or YouTube RTMP) continuous.
 """
 
 import os
@@ -10,7 +14,9 @@ import time
 import signal
 import subprocess
 import threading
+import tempfile
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import yaml
 import yt_dlp
@@ -26,9 +32,107 @@ current_camera_index = 0
 running = False
 stop_event = threading.Event()
 
-current_ffmpeg = None
-buffer_processes = {}
+http_server = None
+hls_dir = None
 
+# Persistent ffmpeg process and FIFO
+ffmpeg_proc = None
+fifo_path = None
+current_ydl = None
+feeder_thread = None
+feeder_lock = threading.Lock()
+
+
+# ─── HLS preview server ────────────────────────────────────────────────
+
+class StreamHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"""<!DOCTYPE html>
+<html><head><title>Live Stream Preview</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<style>
+  body { background: #111; color: #eee; font-family: sans-serif; text-align: center; margin: 2em; }
+  video { max-width: 100%; background: #000; }
+  #status { margin-top: 1em; color: #aaa; }
+</style>
+</head>
+<body>
+<h1>Live Stream Preview</h1>
+<video id="video" controls autoplay muted></video>
+<div id="status">Connecting...</div>
+<script>
+var video = document.getElementById('video');
+var status = document.getElementById('status');
+if (Hls.isSupported()) {
+    var hls = new Hls({
+        liveSyncDuration: 3,
+        liveMaxLatencyDuration: 10,
+        liveDurationInfinity: true,
+        manifestLoadingTimeOut: 10000,
+        manifestLoadingMaxRetry: 30,
+        manifestLoadingRetryDelay: 1000,
+    });
+    hls.loadSource('/stream/live.m3u8');
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        status.textContent = 'Playing';
+        video.play();
+    });
+    hls.on(Hls.Events.ERROR, function(event, data) {
+        if (data.fatal) {
+            status.textContent = 'Reconnecting...';
+            setTimeout(function() { hls.loadSource('/stream/live.m3u8'); }, 2000);
+        }
+    });
+} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = '/stream/live.m3u8';
+    video.addEventListener('loadedmetadata', function() {
+        status.textContent = 'Playing';
+        video.play();
+    });
+}
+</script>
+</body></html>""")
+        elif self.path.startswith("/stream/"):
+            filename = os.path.basename(self.path)
+            # Map live.m3u8 to ffmpeg's stream.m3u8
+            if filename == "live.m3u8":
+                filename = "stream.m3u8"
+            filepath = os.path.join(hls_dir, filename)
+            if os.path.exists(filepath):
+                self.send_response(200)
+                if filename.endswith(".m3u8"):
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                elif filename.endswith(".ts"):
+                    self.send_header("Content-Type", "video/mp2t")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with open(filepath, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_http_server():
+    global http_server
+    http_server = HTTPServer(("0.0.0.0", 8080), StreamHandler)
+    http_server.serve_forever()
+
+
+# ─── Core setup ─────────────────────────────────────────────────────────
 
 def setup_logging():
     global logger
@@ -49,230 +153,238 @@ def load_config():
     if not config_path.exists():
         logger.error(f"Config file not found: {config_path}")
         sys.exit(1)
-    
+
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
-    
+
     logger.info(f"Loaded config with {len(config['cameras'])} cameras")
     logger.info(f"Switch interval: {config['stream']['switch_interval']} seconds")
     logger.info(f"Preview mode: {config['stream']['preview_mode']}")
 
 
+# ─── Camera helpers ─────────────────────────────────────────────────────
+
 def get_current_camera():
-    global current_camera_index
     cameras = config["cameras"]
     return cameras[current_camera_index % len(cameras)]
 
 
-def next_camera():
+def advance_camera():
     global current_camera_index
     cameras = config["cameras"]
     current_camera_index = (current_camera_index + 1) % len(cameras)
     return get_current_camera()
 
 
-def get_next_camera():
-    cameras = config["cameras"]
-    return cameras[(current_camera_index + 1) % len(cameras)]
+# ─── FIFO + persistent ffmpeg ───────────────────────────────────────────
+
+def create_fifo():
+    """Create a named pipe for feeding data to ffmpeg."""
+    global fifo_path
+    tmp_dir = tempfile.mkdtemp(prefix="livestream_fifo_")
+    fifo_path = os.path.join(tmp_dir, "feed.pipe")
+    os.mkfifo(fifo_path)
+    logger.info(f"Created FIFO: {fifo_path}")
 
 
-def get_stream_url(youtube_id):
-    """Extract direct HLS stream URL from YouTube video."""
-    ydl_opts = {
-        "format": "best",
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-    }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(
-                f"https://www.youtube.com/watch?v={youtube_id}",
-                download=False
-            )
-            if info:
-                return info.get("url")
-    except Exception as e:
-        logger.error(f"Error fetching stream URL: {e}")
-    return None
+def start_ffmpeg():
+    """Start the single persistent ffmpeg process reading from the FIFO."""
+    global ffmpeg_proc
 
-
-def start_stream_proc(youtube_id, preview=True):
-    """Start yt-dlp piped to ffmpeg."""
     ffmpeg_opts = config["ffmpeg"]
     stream_opts = config["stream"]
     audio_opts = config["audio"]
-    
-    res = ffmpeg_opts.get("resolution", "1920x1080").split("x")
-    width, height = int(res[0]), int(res[1])
+    preview_mode = stream_opts.get("preview_mode", True)
+
     video_bitrate = ffmpeg_opts.get("video_bitrate", "4500k")
     audio_bitrate = ffmpeg_opts.get("audio_bitrate", "128k")
     framerate = ffmpeg_opts.get("framerate", 30)
-    
     music_volume = audio_opts.get("music_volume", 0.3)
     music_file = audio_opts.get("music_file", "")
-    
+
     if music_file and not os.path.isabs(music_file):
         music_file = str(SCRIPT_DIR / music_file)
-    
-    ydl_cmd = [
-        "yt-dlp",
-        "-f", "best",
-        "--hls-prefer-ffmpeg",
-        "-o", "-",
-        f"https://www.youtube.com/watch?v={youtube_id}"
-    ]
-    
+
     ffmpeg_cmd = [
         "ffmpeg",
         "-re",
-        "-i", "pipe:0",
+        "-fflags", "+genpts+igndts",
+        "-i", fifo_path,
     ]
-    
+
     if music_file and os.path.exists(music_file):
         ffmpeg_cmd.extend([
-            "-stream_loop", "0", "-i", music_file,
+            "-stream_loop", "-1", "-i", music_file,
             "-filter_complex", f"[1:a]volume={music_volume}[music];[0:a][music]amix=inputs=2:duration=first[aout]",
             "-map", "0:v", "-map", "[aout]",
         ])
-    else:
-        ffmpeg_cmd.extend(["-c:v", "copy"])
-    
+
     ffmpeg_cmd.extend([
-        "-c:v", "libx264", "-preset", "veryfast", "-b:v", video_bitrate, "-maxrate", video_bitrate, "-g", str(framerate * 2),
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-b:v", video_bitrate, "-maxrate", video_bitrate,
+        "-g", str(framerate * 2),
         "-c:a", "aac", "-b:a", audio_bitrate,
         "-r", str(framerate),
     ])
-    
-    if preview:
-        width_half = width // 2
-        height_half = height // 2
+
+    if preview_mode:
         ffmpeg_cmd.extend([
-            "-f", "null", "-"
+            "-f", "hls",
+            "-hls_time", "2",
+            "-hls_list_size", "10",
+            "-hls_flags", "delete_segments",
+            "-hls_segment_filename", os.path.join(hls_dir, "seg%05d.ts"),
+            os.path.join(hls_dir, "stream.m3u8"),
         ])
     else:
         rtmp_url = stream_opts.get("youtube", {}).get("rtmp_url", "")
         stream_key = stream_opts.get("youtube", {}).get("stream_key", "")
-        if stream_key:
-            ffmpeg_cmd.extend(["-f", "flv", f"{rtmp_url}/{stream_key}"])
-        else:
+        if not stream_key:
             logger.error("No stream key configured!")
-            return None
-    
-    try:
-        ydl_proc = subprocess.Popen(
-            ydl_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        
-        ffmpeg_proc = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=ydl_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(SCRIPT_DIR)
-        )
-        
-        ydl_proc.stdout.close()
-        
-        return {"ydl": ydl_proc, "ffmpeg": ffmpeg_proc}
-        
-    except Exception as e:
-        logger.error(f"Failed to start stream: {e}")
-        return None
+            return False
+        ffmpeg_cmd.extend(["-f", "flv", f"{rtmp_url}/{stream_key}"])
+
+    logger.info(f"Starting persistent ffmpeg ({'HLS preview' if preview_mode else 'YouTube RTMP'})")
+
+    ffmpeg_proc = subprocess.Popen(
+        ffmpeg_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(SCRIPT_DIR),
+        start_new_session=True,
+    )
+    return True
 
 
-def stop_stream_proc(proc_dict):
-    if not proc_dict:
-        return
-    
-    try:
-        if proc_dict.get("preview"):
-            proc_dict["ffmpeg"].terminate()
-            proc_dict["ffmpeg"].wait(timeout=3)
-        else:
-            proc_dict["ffmpeg"].terminate()
-            proc_dict["ydl"].terminate()
-            proc_dict["ffmpeg"].wait(timeout=3)
-            proc_dict["ydl"].wait(timeout=3)
-    except:
-        proc_dict["ffmpeg"].kill()
-        if proc_dict.get("ydl"):
-            proc_dict["ydl"].kill()
+def start_ydl_feeder(youtube_id):
+    """Start a yt-dlp process that writes to the FIFO. Runs in a thread
+    so the FIFO open (which blocks until ffmpeg reads) doesn't stall the main loop."""
+    global current_ydl, feeder_thread
 
+    def _feed():
+        global current_ydl
+        ydl_cmd = [
+            "yt-dlp",
+            "-f", "best",
+            "--hls-prefer-ffmpeg",
+            "-o", "-",
+            f"https://www.youtube.com/watch?v={youtube_id}",
+        ]
+        try:
+            fifo_fd = os.open(fifo_path, os.O_WRONLY)
+        except OSError as e:
+            logger.error(f"Failed to open FIFO for writing: {e}")
+            return
+
+        try:
+            proc = subprocess.Popen(
+                ydl_cmd,
+                stdout=fifo_fd,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            with feeder_lock:
+                current_ydl = proc
+            proc.wait()
+        except Exception as e:
+            logger.error(f"yt-dlp feeder error: {e}")
+        finally:
+            try:
+                os.close(fifo_fd)
+            except:
+                pass
+
+    feeder_thread = threading.Thread(target=_feed, daemon=True)
+    feeder_thread.start()
+    # Give yt-dlp a moment to start and open the FIFO
+    time.sleep(1)
+
+
+def stop_ydl_feeder():
+    """Stop the current yt-dlp feeder process."""
+    global current_ydl
+    with feeder_lock:
+        proc = current_ydl
+        current_ydl = None
+
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except:
+            try:
+                proc.kill()
+            except:
+                pass
+
+
+def stop_ffmpeg():
+    """Stop the persistent ffmpeg process."""
+    global ffmpeg_proc
+    if ffmpeg_proc and ffmpeg_proc.poll() is None:
+        try:
+            ffmpeg_proc.terminate()
+            ffmpeg_proc.wait(timeout=5)
+        except:
+            try:
+                ffmpeg_proc.kill()
+            except:
+                pass
+    ffmpeg_proc = None
+
+
+# ─── Main loop ──────────────────────────────────────────────────────────
 
 def stream_loop():
     """Main loop that cycles through cameras."""
-    global running, current_camera_index, current_ffmpeg
-    
+    global running, current_camera_index
+
     switch_interval = config["stream"]["switch_interval"]
     cameras = config["cameras"]
-    preview_mode = config["stream"].get("preview_mode", True)
-    
+
     logger.info(f"Starting stream loop with {len(cameras)} cameras")
     logger.info(f"Each camera shown for {switch_interval} seconds")
-    
+
     current_cam = get_current_camera()
     logger.info(f"Starting with camera: {current_cam['name']}")
-    
-    current_ffmpeg = start_stream_proc(current_cam["youtube_id"], preview_mode)
-    if not current_ffmpeg:
-        logger.error("Failed to start initial stream")
-        return
-    
-    prebuffered_stream = {}
-    prebuffer_camera_id = None
-    
+
+    # Start yt-dlp feeding into the FIFO -> ffmpeg reads from it
+    start_ydl_feeder(current_cam["youtube_id"])
+
     while running and not stop_event.is_set():
+        # Wait for the switch interval
         elapsed = 0
         while running and elapsed < switch_interval and not stop_event.is_set():
-            if current_ffmpeg and current_ffmpeg["ffmpeg"].poll() is not None:
-                logger.warning("Stream process ended, restarting...")
-                current_cam = get_current_camera()
-                current_ffmpeg = start_stream_proc(current_cam["youtube_id"], preview_mode)
-                if not current_ffmpeg:
-                    time.sleep(5)
-                    break
-            
+            # Check if ffmpeg died
+            if ffmpeg_proc and ffmpeg_proc.poll() is not None:
+                logger.error("ffmpeg process died unexpectedly")
+                running = False
+                break
+
+            # Check if yt-dlp feeder died (camera may be offline)
+            with feeder_lock:
+                ydl = current_ydl
+            if ydl and ydl.poll() is not None:
+                logger.warning("yt-dlp feeder ended (camera offline?), switching early...")
+                break
+
             time.sleep(1)
             elapsed += 1
-            
-            if elapsed >= switch_interval - 3 and not prebuffered_stream:
-                next_cam = get_next_camera()
-                logger.info(f"Pre-buffering next camera: {next_cam['name']}")
-                prebuffered_stream = start_stream_proc(next_cam["youtube_id"], preview_mode)
-                prebuffer_camera_id = next_cam["youtube_id"]
-                time.sleep(1)
-        
+
         if not running or stop_event.is_set():
             break
-        
-        next_cam = next_camera()
+
+        # Switch to next camera
+        next_cam = advance_camera()
         logger.info(f"Switching to camera: {next_cam['name']}")
-        
-        if current_ffmpeg:
-            stop_stream_proc(current_ffmpeg)
-        
-        if prebuffered_stream and prebuffer_camera_id == next_cam["youtube_id"]:
-            current_ffmpeg = prebuffered_stream
-            prebuffered_stream = {}
-            prebuffer_camera_id = None
-        else:
-            if prebuffered_stream:
-                stop_stream_proc(prebuffered_stream)
-            current_ffmpeg = start_stream_proc(next_cam["youtube_id"], preview_mode)
-        
-        if not current_ffmpeg:
-            logger.error("Failed to start stream after switch, retrying in 5s")
-            time.sleep(5)
-    
-    if current_ffmpeg:
-        stop_stream_proc(current_ffmpeg)
-    if prebuffered_stream:
-        stop_stream_proc(prebuffered_stream)
-    
+
+        # Stop old yt-dlp, start new one - ffmpeg keeps running
+        stop_ydl_feeder()
+        start_ydl_feeder(next_cam["youtube_id"])
+
+    # Cleanup
+    stop_ydl_feeder()
+
     logger.info("Stream loop ended")
 
 
@@ -284,31 +396,59 @@ def signal_handler(signum, frame):
 
 
 def main():
-    global running
-    
+    global running, hls_dir
+
     setup_logging()
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     logger.info("=" * 50)
     logger.info("Live Stream Switcher")
     logger.info("=" * 50)
-    
+
     load_config()
-    
+
+    preview_mode = config["stream"].get("preview_mode", True)
+
+    if preview_mode:
+        hls_dir = tempfile.mkdtemp(prefix="livestream_hls_")
+        logger.info(f"HLS segments directory: {hls_dir}")
+
+        server_thread = threading.Thread(target=start_http_server, daemon=True)
+        server_thread.start()
+        logger.info("HTTP preview server started at http://localhost:8080")
+
     music_file = config["audio"].get("music_file", "")
     if music_file:
         if not os.path.isabs(music_file):
             music_file = str(SCRIPT_DIR / music_file)
         if not os.path.exists(music_file):
             logger.warning(f"Music file not found: {music_file}")
-    
+
+    # Create FIFO and start the single persistent ffmpeg
+    create_fifo()
+
+    running = True
+
+    # Start ffmpeg in a background thread because it blocks until the FIFO
+    # is opened for writing (by the first yt-dlp feeder)
+    ffmpeg_thread = threading.Thread(target=start_ffmpeg, daemon=True)
+    ffmpeg_thread.start()
+
     try:
-        running = True
         stream_loop()
+        ffmpeg_thread.join(timeout=2)
     finally:
         stop_event.set()
+        stop_ffmpeg()
+        # Clean up FIFO
+        if fifo_path:
+            try:
+                os.unlink(fifo_path)
+                os.rmdir(os.path.dirname(fifo_path))
+            except:
+                pass
         logger.info("Streamer stopped")
 
 
