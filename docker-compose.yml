@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  streamer:
+    build: .
+    container_name: youtube-streamer
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./music:/app/music:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    network_mode: host
+    restart: unless-stopped

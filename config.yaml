@@ -1,0 +1,58 @@
+# Streamer Configuration
+
+# Camera configuration
+# Each camera: { name, youtube_id }
+cameras:
+  - name: "Silver Lake Lodge"
+    youtube_id: "uE_ent5rC3Y"
+  - name: "Empire Express Chairlift"
+    youtube_id: "r8qiPv9XCOM"
+  - name: "Hoodoo Express Chairlift"
+    youtube_id: "RP7pLzpoQeU"
+  - name: "Snow Park Lodge"
+    youtube_id: "E7Hh7Q6qIKk"
+  - name: "Revalator Express Chairlift"
+    youtube_id: "XZjubaPbamE"
+  - name: "Keetley Point"
+    youtube_id: "UjW5Wej2wAU"
+
+# Stream settings
+stream:
+  # How long to show each camera (seconds)
+  switch_interval: 10
+  
+  # Preview mode (true) or stream to YouTube (false)
+  preview_mode: true
+  
+  # YouTube RTMP settings (only used when preview_mode: false)
+  youtube:
+    rtmp_url: "rtmps://a.rtmp.youtube.com/live2"
+    stream_key: ""  # Add your stream key here
+
+# Audio settings
+audio:
+  # Background music file (leave empty to use default royalty-free)
+  music_file: "music/ambient.mp3"
+  
+  # Music volume (0.0 to 1.0)
+  music_volume: 0.3
+  
+  # Whether to include original camera audio
+  include_camera_audio: true
+  
+  # Camera audio volume (0.0 to 1.0)
+  camera_audio_volume: 0.7
+
+# FFmpeg settings
+ffmpeg:
+  # Video resolution
+  resolution: "1920x1080"
+  
+  # Video bitrate
+  video_bitrate: "4500k"
+  
+  # Audio bitrate
+  audio_bitrate: "128k"
+  
+  # Framerate
+  framerate: 30

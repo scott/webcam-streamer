@@ -1,0 +1,10 @@
+# Live Stream Switcher Dependencies
+
+# Core
+PyYAML>=6.0
+
+# YouTube stream extraction
+yt-dlp>=2024.12.23
+
+# Logging
+colorlog>=2.2.0
