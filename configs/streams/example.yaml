@@ -1,0 +1,17 @@
+# Example stream configuration
+# Copy this file and rename it to create a new stream
+
+name: "My Stream"
+
+stream:
+  switch_interval: 15
+  preview_mode: false
+  youtube:
+    rtmp_url: "rtmps://a.rtmp.youtube.com/live2"
+    # stream_key_env: "YOUTUBE_KEY_EXAMPLE"  # Optional: auto-derived from filename if not set
+
+cameras:
+  - name: "Camera 1"
+    youtube_id: "uE_ent5rC3Y"
+  - name: "Camera 2"
+    youtube_id: "r8qiPv9XCOM"

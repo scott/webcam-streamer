@@ -1,0 +1,21 @@
+# Base configuration - inherited by all streams
+# Override values in individual stream configs
+
+# FFmpeg settings (shared across all streams)
+ffmpeg:
+  resolution: "1920x1080"
+  video_bitrate: "6800k"
+  audio_bitrate: "128k"
+  framerate: 30
+
+# Audio settings (shared across all streams)
+audio:
+  music_file: "music/ambient.mp3"
+  music_volume: 0.3
+  include_camera_audio: true
+  camera_audio_volume: 0.7
+
+# Default stream settings
+stream:
+  preview_mode: false
+  switch_interval: 15

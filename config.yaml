@@ -27,7 +27,7 @@ stream:
   # YouTube RTMP settings (only used when preview_mode: false)
   youtube:
     rtmp_url: "rtmps://a.rtmp.youtube.com/live2"
-    stream_key: ""  # Add your stream key here
+    stream_key: "d01k-fbhc-qv01-ez0f-99ep"
 
 # Audio settings
 audio:

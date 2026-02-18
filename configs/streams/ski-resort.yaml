@@ -1,0 +1,23 @@
+# Ski Resort Stream Configuration
+
+name: "Ski Resort Stream"
+
+stream:
+  switch_interval: 15
+  preview_mode: false
+  youtube:
+    rtmp_url: "rtmps://a.rtmp.youtube.com/live2"
+
+cameras:
+  - name: "Silver Lake Lodge"
+    youtube_id: "uE_ent5rC3Y"
+  - name: "Empire Express Chairlift"
+    youtube_id: "r8qiPv9XCOM"
+  - name: "Hoodoo Express Chairlift"
+    youtube_id: "RP7pLzpoQeU"
+  - name: "Snow Park Lodge"
+    youtube_id: "E7Hh7Q6qIKk"
+  - name: "Revalator Express Chairlift"
+    youtube_id: "XZjubaPbamE"
+  - name: "Keetley Point"
+    youtube_id: "UjW5Wej2wAU"

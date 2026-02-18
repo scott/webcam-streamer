@@ -6,6 +6,10 @@ Cycles through YouTube live camera streams with seamless switching.
 Uses a single persistent ffmpeg process reading from stdin via a buffer thread.
 Camera switches are done by swapping which yt-dlp process the buffer reads from.
 This keeps the output stream (HLS preview or YouTube RTMP) continuous.
+
+Supports multiple streams via config inheritance:
+  - Base config: configs/base.yaml (shared defaults)
+  - Stream config: configs/streams/<name>.yaml (per-stream settings)
 """
 
 import os
@@ -17,16 +21,18 @@ import threading
 import tempfile
 import select
 import logging
+import argparse
+import re
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from queue import Queue, Empty
+from copy import deepcopy
 
 import yaml
 import yt_dlp
 import colorlog
 from colorlog import ColoredFormatter
 
-CONFIG_FILE = "config.yaml"
 SCRIPT_DIR = Path(__file__).parent
 
 logger = None
@@ -67,6 +73,99 @@ def setup_logging():
     logger = colorlog.getLogger(__name__)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+
+# ─── Config Loading ───────────────────────────────────────────────────────
+
+def expand_env_vars(value):
+    """Recursively expand ${VAR_NAME} patterns in config values."""
+    if isinstance(value, str):
+        pattern = r'\$\{(\w+)\}'
+        def replace(match):
+            var_name = match.group(1)
+            env_value = os.environ.get(var_name, '')
+            if not env_value:
+                logger.warning(f"Environment variable {var_name} is not set")
+            return env_value
+        return re.sub(pattern, replace, value)
+    elif isinstance(value, dict):
+        return {k: expand_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [expand_env_vars(item) for item in value]
+    else:
+        return value
+
+
+def deep_merge(base, override):
+    """Deep merge override dict into base dict. Override takes precedence."""
+    result = deepcopy(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def derive_stream_key_env(stream_name):
+    """Derive env var name from stream config filename."""
+    return f"YOUTUBE_KEY_{stream_name.upper().replace('-', '_')}"
+
+
+def load_config(stream_config_path, base_config_path=None):
+    """Load configuration with inheritance from base config."""
+    global config
+    
+    stream_path = Path(stream_config_path)
+    if not stream_path.exists():
+        logger.error(f"Stream config file not found: {stream_path}")
+        sys.exit(1)
+    
+    # Load stream config
+    with open(stream_path) as f:
+        stream_cfg = yaml.safe_load(f)
+    
+    # Get display name from config, derive env var name from filename
+    display_name = stream_cfg.get('name') or stream_path.stem
+    stream_filename = stream_path.stem  # e.g., "ski-resort" from "ski-resort.yaml"
+    
+    # Load base config if provided
+    base_cfg = {}
+    if base_config_path:
+        base_path = Path(base_config_path)
+        if base_path.exists():
+            with open(base_path) as f:
+                base_cfg = yaml.safe_load(f) or {}
+    
+    # Deep merge: base first, then stream overrides
+    config = deep_merge(base_cfg, stream_cfg)
+    
+    # Set stream name if not in config
+    if 'name' not in config:
+        config['name'] = display_name
+    
+    # Handle stream key: either from explicit config or derived from env var
+    stream_opts = config.get('stream', {})
+    youtube_opts = stream_opts.get('youtube', {})
+    
+    if 'stream_key' not in youtube_opts:
+        # Try to get from env var - use filename for derivation
+        env_var = youtube_opts.get('stream_key_env') or derive_stream_key_env(stream_filename)
+        stream_key = os.environ.get(env_var, '')
+        if stream_key:
+            youtube_opts['stream_key'] = stream_key
+            # Remove the _env key after use
+            youtube_opts.pop('stream_key_env', None)
+        else:
+            logger.warning(f"No stream key found for {stream_name}. "
+                          f"Expected env var {env_var} to be set.")
+    
+    # Expand any ${VAR} patterns in config
+    config = expand_env_vars(config)
+    
+    logger.info(f"Loaded config for stream: {config.get('name', 'unnamed')}")
+    logger.info(f"Switch interval: {config['stream']['switch_interval']} seconds")
+    logger.info(f"Preview mode: {config['stream'].get('preview_mode', True)}")
 
 
 # ─── HLS preview server ────────────────────────────────────────────────
@@ -517,25 +616,18 @@ def signal_handler(signum, frame):
     buffer_stop_event.set()
 
 
-def load_config():
-    """Load configuration from YAML file."""
-    global config
-    config_path = SCRIPT_DIR / CONFIG_FILE
-    if not config_path.exists():
-        logger.error(f"Config file not found: {config_path}")
-        sys.exit(1)
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
-    logger.info(f"Loaded config with {len(config['cameras'])} cameras")
-    logger.info(f"Switch interval: {config['stream']['switch_interval']} seconds")
-    logger.info(f"Preview mode: {config['stream'].get('preview_mode', True)}")
-
-
 def main():
     global running, hls_dir
 
+    # Parse CLI arguments
+    parser = argparse.ArgumentParser(description='Webcam Streamer - Live stream switcher')
+    parser.add_argument('--config', required=True, help='Path to stream config file')
+    parser.add_argument('--port', type=int, default=8080, help='HTTP server port (default: 8080)')
+    parser.add_argument('--base-config', default='configs/base.yaml', help='Base config to inherit from')
+    args = parser.parse_args()
+
     setup_logging()
-    load_config()
+    load_config(args.config, args.base_config)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -548,7 +640,7 @@ def main():
     # Start HLS preview server if enabled
     preview_mode = config["stream"].get("preview_mode", True)
     if preview_mode:
-        http_port = config["stream"].get("http_port", 8080)
+        http_port = args.port
         http_thread = threading.Thread(target=start_http_server, args=(http_port,), daemon=True)
         http_thread.start()
 

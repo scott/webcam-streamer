@@ -14,7 +14,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py *.sh *.yaml ./
+COPY *.py *.sh ./
+COPY configs ./configs
 COPY music ./music
 
 RUN mkdir -p /app/stream_buffers && \
@@ -22,4 +23,5 @@ RUN mkdir -p /app/stream_buffers && \
 
 ENV PATH="/root/.local/bin:${PATH}"
 
-CMD ["python", "stream_manager.py"]
+# Default CMD - requires --config argument
+CMD ["python", "stream_manager.py", "--config", "configs/streams/ski-resort.yaml"]

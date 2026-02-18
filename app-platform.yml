@@ -1,0 +1,41 @@
+name: webcam-streamer
+region: nyc
+
+# Add each stream as a separate service
+# Each service runs its own container with its own config
+
+services:
+  # Stream 1: Ski Resort
+  - name: stream-ski-resort
+    image:
+      registry_type: DO
+      repository: webcam-streamer
+      tag: latest
+    environment:
+      - STREAM_CONFIG=configs/streams/ski-resort.yaml
+      - YOUTUBE_KEY_SKI_RESORT=${YOUTUBE_KEY_SKI_RESORT}
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    routes:
+      - path: /
+
+  # Stream 2: Example (comment out or remove if not needed)
+  # - name: stream-example
+  #   image:
+  #     registry_type: DO
+  #     repository: webcam-streamer
+  #     tag: latest
+  #   environment:
+  #     - STREAM_CONFIG=configs/streams/example.yaml
+  #     - YOUTUBE_KEY_EXAMPLE=${YOUTUBE_KEY_EXAMPLE}
+  #   http_port: 8080
+  #   instance_count: 1
+  #   instance_size_slug: basic-xxs
+
+# How to add a new stream:
+# 1. Create config file: configs/streams/new-stream.yaml
+# 2. Add environment variable in DO dashboard: YOUTUBE_KEY_NEWSTREAM
+# 3. Add a new service block above (copy stream-ski-resort as template)
+# 4. Change name, STREAM_CONFIG, and YOUTUBE_KEY_* to match your new stream
+# 5. Redeploy the app

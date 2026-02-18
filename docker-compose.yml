@@ -1,13 +1,44 @@
 version: '3.8'
 
+# Multi-stream Docker Compose
+# Use this for local development or small deployments
+# For many streams, use app-platform.yml on DO
+
 services:
-  streamer:
+  # Stream 1: Ski Resort
+  stream-ski-resort:
     build: .
-    container_name: youtube-streamer
+    container_name: webcam-streamer-ski-resort
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - ./configs:/app/configs:ro
       - ./music:/app/music:ro
     environment:
       - PYTHONUNBUFFERED=1
-    network_mode: host
+      - STREAM_CONFIG=configs/streams/ski-resort.yaml
+      - YOUTUBE_KEY_SKI_RESORT=${YOUTUBE_KEY_SKI_RESORT}
+    ports:
+      - "8080:8080"
     restart: unless-stopped
+    networks:
+      - stream-network
+
+  # Stream 2: Example (commented out - uncomment to enable)
+  # stream-example:
+  #   build: .
+  #   container_name: webcam-streamer-example
+  #   volumes:
+  #     - ./configs:/app/configs:ro
+  #     - ./music:/app/music:ro
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - STREAM_CONFIG=configs/streams/example.yaml
+  #     - YOUTUBE_KEY_EXAMPLE=${YOUTUBE_KEY_EXAMPLE}
+  #   ports:
+  #     - "8081:8080"
+  #   restart: unless-stopped
+  #   networks:
+  #     - stream-network
+
+networks:
+  stream-network:
+    driver: bridge
