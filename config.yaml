@@ -19,10 +19,10 @@ cameras:
 # Stream settings
 stream:
   # How long to show each camera (seconds)
-  switch_interval: 10
+  switch_interval: 30
   
   # Preview mode (true) or stream to YouTube (false)
-  preview_mode: true
+  preview_mode: false
   
   # YouTube RTMP settings (only used when preview_mode: false)
   youtube:
@@ -49,7 +49,7 @@ ffmpeg:
   resolution: "1920x1080"
   
   # Video bitrate
-  video_bitrate: "4500k"
+  video_bitrate: "6800k"
   
   # Audio bitrate
   audio_bitrate: "128k"

@@ -39,6 +39,7 @@ hls_dir = None
 ffmpeg_proc = None
 fifo_path = None
 current_ydl = None
+current_feeder_ffmpeg = None
 feeder_thread = None
 feeder_lock = threading.Lock()
 
@@ -208,7 +209,9 @@ def start_ffmpeg():
     ffmpeg_cmd = [
         "ffmpeg",
         "-re",
-        "-fflags", "+genpts+igndts",
+        "-fflags", "+genpts+igndts+discardcorrupt",
+        "-rw_timeout", "10000000",
+        "-f", "mpegts",
         "-i", fifo_path,
     ]
 
@@ -257,12 +260,16 @@ def start_ffmpeg():
 
 
 def start_ydl_feeder(youtube_id):
-    """Start a yt-dlp process that writes to the FIFO. Runs in a thread
-    so the FIFO open (which blocks until ffmpeg reads) doesn't stall the main loop."""
-    global current_ydl, feeder_thread
+    """Start a yt-dlp process piped through an intermediate ffmpeg that
+    normalizes the stream to raw mpegts before writing to the FIFO.
+    This ensures consistent format/timestamps across camera switches."""
+    global current_ydl, current_feeder_ffmpeg, feeder_thread
+
+    ffmpeg_opts = config["ffmpeg"]
+    framerate = ffmpeg_opts.get("framerate", 30)
 
     def _feed():
-        global current_ydl
+        global current_ydl, current_feeder_ffmpeg
         ydl_cmd = [
             "yt-dlp",
             "-f", "best",
@@ -270,6 +277,20 @@ def start_ydl_feeder(youtube_id):
             "-o", "-",
             f"https://www.youtube.com/watch?v={youtube_id}",
         ]
+
+        # Intermediate ffmpeg: remux to mpegts without re-encoding
+        # The persistent ffmpeg handles the actual encode
+        normalize_cmd = [
+            "ffmpeg",
+            "-i", "pipe:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            "-fflags", "+genpts",
+            "-reset_timestamps", "1",
+            "-f", "mpegts",
+            "pipe:1",
+        ]
+
         try:
             fifo_fd = os.open(fifo_path, os.O_WRONLY)
         except OSError as e:
@@ -277,15 +298,26 @@ def start_ydl_feeder(youtube_id):
             return
 
         try:
-            proc = subprocess.Popen(
+            ydl_proc = subprocess.Popen(
                 ydl_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            norm_proc = subprocess.Popen(
+                normalize_cmd,
+                stdin=ydl_proc.stdout,
                 stdout=fifo_fd,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            # Allow yt-dlp to receive SIGPIPE if normalize proc exits
+            ydl_proc.stdout.close()
+
             with feeder_lock:
-                current_ydl = proc
-            proc.wait()
+                current_ydl = ydl_proc
+                current_feeder_ffmpeg = norm_proc
+            norm_proc.wait()
         except Exception as e:
             logger.error(f"yt-dlp feeder error: {e}")
         finally:
@@ -296,26 +328,29 @@ def start_ydl_feeder(youtube_id):
 
     feeder_thread = threading.Thread(target=_feed, daemon=True)
     feeder_thread.start()
-    # Give yt-dlp a moment to start and open the FIFO
-    time.sleep(1)
+    # Give yt-dlp + normalizer a moment to start
+    time.sleep(2)
 
 
 def stop_ydl_feeder():
-    """Stop the current yt-dlp feeder process."""
-    global current_ydl
+    """Stop the current yt-dlp feeder and its intermediate ffmpeg process."""
+    global current_ydl, current_feeder_ffmpeg
     with feeder_lock:
-        proc = current_ydl
+        ydl_proc = current_ydl
+        norm_proc = current_feeder_ffmpeg
         current_ydl = None
+        current_feeder_ffmpeg = None
 
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except:
+    for proc in [ydl_proc, norm_proc]:
+        if proc and proc.poll() is None:
             try:
-                proc.kill()
+                proc.terminate()
+                proc.wait(timeout=3)
             except:
-                pass
+                try:
+                    proc.kill()
+                except:
+                    pass
 
 
 def stop_ffmpeg():
@@ -361,10 +396,11 @@ def stream_loop():
                 running = False
                 break
 
-            # Check if yt-dlp feeder died (camera may be offline)
+            # Check if yt-dlp feeder or normalizer died (camera may be offline)
             with feeder_lock:
                 ydl = current_ydl
-            if ydl and ydl.poll() is not None:
+                norm = current_feeder_ffmpeg
+            if (ydl and ydl.poll() is not None) or (norm and norm.poll() is not None):
                 logger.warning("yt-dlp feeder ended (camera offline?), switching early...")
                 break
 
@@ -378,7 +414,7 @@ def stream_loop():
         next_cam = advance_camera()
         logger.info(f"Switching to camera: {next_cam['name']}")
 
-        # Stop old yt-dlp, start new one - ffmpeg keeps running
+        # Stop old feeder, start new one - ffmpeg keeps running
         stop_ydl_feeder()
         start_ydl_feeder(next_cam["youtube_id"])
 
