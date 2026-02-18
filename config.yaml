@@ -19,7 +19,7 @@ cameras:
 # Stream settings
 stream:
   # How long to show each camera (seconds)
-  switch_interval: 30
+  switch_interval: 15
   
   # Preview mode (true) or stream to YouTube (false)
   preview_mode: false

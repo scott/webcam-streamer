@@ -3,8 +3,8 @@
 Live Stream Switcher
 Cycles through YouTube live camera streams with seamless switching.
 
-Uses a single persistent ffmpeg process reading from a named pipe (FIFO).
-Camera switches are done by swapping which yt-dlp process writes to the pipe.
+Uses a single persistent ffmpeg process reading from stdin via a buffer thread.
+Camera switches are done by swapping which yt-dlp process the buffer reads from.
 This keeps the output stream (HLS preview or YouTube RTMP) continuous.
 """
 
@@ -15,8 +15,11 @@ import signal
 import subprocess
 import threading
 import tempfile
+import select
+import logging
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from queue import Queue, Empty
 
 import yaml
 import yt_dlp
@@ -35,13 +38,35 @@ stop_event = threading.Event()
 http_server = None
 hls_dir = None
 
-# Persistent ffmpeg process and FIFO
+# Persistent ffmpeg process
 ffmpeg_proc = None
-fifo_path = None
-current_ydl = None
-current_feeder_ffmpeg = None
-feeder_thread = None
-feeder_lock = threading.Lock()
+
+# Buffer thread and camera switching
+buffer_thread = None
+buffer_stop_event = threading.Event()
+current_camera_proc = None  # The yt-dlp + ffmpeg normalizer pipeline
+camera_lock = threading.Lock()
+
+
+def setup_logging():
+    """Setup colored logging."""
+    global logger
+    formatter = ColoredFormatter(
+        "%(log_color)s%(asctime)s [%(levelname)s]%(reset)s %(message)s",
+        datefmt="%H:%M:%S",
+        log_colors={
+            'DEBUG': 'cyan',
+            'INFO': 'green',
+            'WARNING': 'yellow',
+            'ERROR': 'red',
+            'CRITICAL': 'red,bg_white',
+        }
+    )
+    handler = colorlog.StreamHandler()
+    handler.setFormatter(formatter)
+    logger = colorlog.getLogger(__name__)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 # ─── HLS preview server ────────────────────────────────────────────────
@@ -99,97 +124,187 @@ if (Hls.isSupported()) {
 </script>
 </body></html>""")
         elif self.path.startswith("/stream/"):
-            filename = os.path.basename(self.path)
-            # Map live.m3u8 to ffmpeg's stream.m3u8
-            if filename == "live.m3u8":
-                filename = "stream.m3u8"
-            filepath = os.path.join(hls_dir, filename)
-            if os.path.exists(filepath):
+            filepath = Path(hls_dir) / self.path[8:]
+            if filepath.exists():
                 self.send_response(200)
-                if filename.endswith(".m3u8"):
+                if self.path.endswith(".m3u8"):
                     self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-                elif filename.endswith(".ts"):
-                    self.send_header("Content-Type", "video/mp2t")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Cache-Control", "no-cache")
+                else:
+                    self.send_header("Content-Type", "video/MP2T")
+                    self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                with open(filepath, "rb") as f:
-                    self.wfile.write(f.read())
+                try:
+                    with open(filepath, "rb") as f:
+                        self.wfile.write(f.read())
+                except Exception:
+                    pass
             else:
-                self.send_response(404)
-                self.end_headers()
+                self.send_error(404)
         else:
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
+            self.send_error(404)
 
     def log_message(self, format, *args):
         pass
 
 
-def start_http_server():
+def start_http_server(port):
+    """Start HTTP server for HLS preview."""
     global http_server
-    http_server = HTTPServer(("0.0.0.0", 8080), StreamHandler)
-    http_server.serve_forever()
+    server = HTTPServer(("", port), StreamHandler)
+    http_server = server
+    logger.info(f"HLS preview server on http://localhost:{port}")
+    server.serve_forever()
 
 
-# ─── Core setup ─────────────────────────────────────────────────────────
-
-def setup_logging():
-    global logger
-    formatter = ColoredFormatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    handler = colorlog.StreamHandler()
-    handler.setFormatter(formatter)
-    logger = colorlog.getLogger()
-    logger.setLevel("INFO")
-    logger.addHandler(handler)
-
-
-def load_config():
-    global config
-    config_path = SCRIPT_DIR / CONFIG_FILE
-    if not config_path.exists():
-        logger.error(f"Config file not found: {config_path}")
-        sys.exit(1)
-
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-
-    logger.info(f"Loaded config with {len(config['cameras'])} cameras")
-    logger.info(f"Switch interval: {config['stream']['switch_interval']} seconds")
-    logger.info(f"Preview mode: {config['stream']['preview_mode']}")
-
-
-# ─── Camera helpers ─────────────────────────────────────────────────────
+# ─── Camera Management ─────────────────────────────────────────────────
 
 def get_current_camera():
+    """Get the current camera from config."""
     cameras = config["cameras"]
     return cameras[current_camera_index % len(cameras)]
 
 
 def advance_camera():
+    """Advance to the next camera."""
     global current_camera_index
     cameras = config["cameras"]
     current_camera_index = (current_camera_index + 1) % len(cameras)
     return get_current_camera()
 
 
-# ─── FIFO + persistent ffmpeg ───────────────────────────────────────────
+def start_camera_feed(youtube_id):
+    """Start a camera feed (yt-dlp + ffmpeg normalizer) and return the output pipe."""
+    ffmpeg_opts = config["ffmpeg"]
+    video_bitrate = ffmpeg_opts.get("video_bitrate", "6800k")
+    audio_bitrate = ffmpeg_opts.get("audio_bitrate", "128k")
+    resolution = ffmpeg_opts.get("resolution", "1920x1080")
+    framerate = ffmpeg_opts.get("framerate", 30)
 
-def create_fifo():
-    """Create a named pipe for feeding data to ffmpeg."""
-    global fifo_path
-    tmp_dir = tempfile.mkdtemp(prefix="livestream_fifo_")
-    fifo_path = os.path.join(tmp_dir, "feed.pipe")
-    os.mkfifo(fifo_path)
-    logger.info(f"Created FIFO: {fifo_path}")
+    ydl_cmd = [
+        "yt-dlp",
+        "-f", "best",
+        "--hls-prefer-ffmpeg",
+        "-o", "-",
+        f"https://www.youtube.com/watch?v={youtube_id}",
+    ]
 
+    normalize_cmd = [
+        "ffmpeg",
+        "-hide_banner", "-loglevel", "error",
+        "-i", "pipe:0",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-b:v", video_bitrate, "-maxrate", video_bitrate,
+        "-bufsize", str(int(video_bitrate.replace("k", "")) * 2) + "k",
+        "-s", resolution,
+        "-r", str(framerate),
+        "-g", str(framerate * 2),
+        "-c:a", "aac", "-b:a", audio_bitrate, "-ar", "44100", "-ac", "2",
+        "-fflags", "+genpts",
+        "-reset_timestamps", "1",
+        "-f", "mpegts",
+        "pipe:1",
+    ]
+
+    try:
+        ydl_proc = subprocess.Popen(
+            ydl_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        norm_proc = subprocess.Popen(
+            normalize_cmd,
+            stdin=ydl_proc.stdout,
+            stdout=subprocess.PIPE,  # Output to pipe that we'll read from
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        # Close yt-dlp's stdout in parent so normalizer gets EOF when it dies
+        ydl_proc.stdout.close()
+        return (ydl_proc, norm_proc)
+    except Exception as e:
+        logger.error(f"Failed to start camera feed: {e}")
+        return None
+
+
+def stop_camera_feed(camera_proc):
+    """Stop a camera feed."""
+    if not camera_proc:
+        return
+    ydl_proc, norm_proc = camera_proc
+    for proc in [ydl_proc, norm_proc]:
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except:
+                try:
+                    proc.kill()
+                except:
+                    pass
+
+
+# ─── Buffer Thread ─────────────────────────────────────────────────────
+
+def buffer_writer():
+    """
+    Continuously reads from the active camera and writes to ffmpeg's stdin.
+    This runs in a separate thread and never stops - we just swap which
+    camera we read from when switching.
+    """
+    global current_camera_proc
+
+    while not buffer_stop_event.is_set():
+        # Get current camera process - re-check frequently to detect switches
+        with camera_lock:
+            cam_proc = current_camera_proc
+
+        if not cam_proc:
+            time.sleep(0.01)  # Short sleep when no camera
+            continue
+
+        _, norm_proc = cam_proc
+        stdout = norm_proc.stdout
+
+        # Read data from camera and write to ffmpeg
+        # Use very short timeout so we re-check current_camera_proc frequently
+        data_written = False
+        try:
+            for _ in range(10):  # Try multiple reads per camera check
+                ready, _, _ = select.select([stdout], [], [], 0.01)
+                if ready:
+                    data = stdout.read(262144)  # Read up to 256KB chunks
+                    if data and ffmpeg_proc and ffmpeg_proc.stdin:
+                        try:
+                            ffmpeg_proc.stdin.write(data)
+                            ffmpeg_proc.stdin.flush()
+                            data_written = True
+                        except (BrokenPipeError, OSError):
+                            # ffmpeg died
+                            return
+                    elif not data:
+                        # Camera ended (EOF) - break to check for new camera
+                        break
+                else:
+                    # No data available, check if camera changed
+                    break
+        except (ValueError, OSError):
+            # Pipe closed or other error - camera probably stopped
+            time.sleep(0.005)
+        except Exception as e:
+            logger.debug(f"Buffer writer error: {e}")
+            time.sleep(0.005)
+
+        # If we didn't write any data, do a tiny sleep to prevent busy-wait
+        if not data_written:
+            time.sleep(0.005)
+
+
+# ─── FFmpeg ────────────────────────────────────────────────────────────
 
 def start_ffmpeg():
-    """Start the single persistent ffmpeg process reading from the FIFO."""
+    """Start the single persistent ffmpeg process reading from stdin via pipe."""
     global ffmpeg_proc
 
     ffmpeg_opts = config["ffmpeg"]
@@ -208,11 +323,14 @@ def start_ffmpeg():
 
     ffmpeg_cmd = [
         "ffmpeg",
-        "-re",
-        "-fflags", "+genpts+igndts+discardcorrupt",
-        "-rw_timeout", "10000000",
+        "-hide_banner", "-loglevel", "error",
+        "-nostdin",
+        "-fflags", "+genpts+igndts+discardcorrupt+nobuffer",
+        "-flags", "+low_delay",
+        "-thread_queue_size", "4096",
         "-f", "mpegts",
-        "-i", fifo_path,
+        "-err_detect", "ignore_err",
+        "-i", "pipe:0",  # Read from stdin
     ]
 
     if music_file and os.path.exists(music_file):
@@ -223,19 +341,17 @@ def start_ffmpeg():
         ])
 
     ffmpeg_cmd.extend([
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-b:v", video_bitrate, "-maxrate", video_bitrate,
-        "-g", str(framerate * 2),
+        "-c:v", "copy",
         "-c:a", "aac", "-b:a", audio_bitrate,
-        "-r", str(framerate),
     ])
 
     if preview_mode:
         ffmpeg_cmd.extend([
             "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "10",
-            "-hls_flags", "delete_segments",
+            "-hls_time", "1",
+            "-hls_list_size", "5",
+            "-hls_flags", "delete_segments+omit_endlist",
+            "-hls_segment_type", "mpegts",
             "-hls_segment_filename", os.path.join(hls_dir, "seg%05d.ts"),
             os.path.join(hls_dir, "stream.m3u8"),
         ])
@@ -251,6 +367,7 @@ def start_ffmpeg():
 
     ffmpeg_proc = subprocess.Popen(
         ffmpeg_cmd,
+        stdin=subprocess.PIPE,  # We write to this
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(SCRIPT_DIR),
@@ -259,104 +376,14 @@ def start_ffmpeg():
     return True
 
 
-def start_ydl_feeder(youtube_id):
-    """Start a yt-dlp process piped through an intermediate ffmpeg that
-    normalizes the stream to raw mpegts before writing to the FIFO.
-    This ensures consistent format/timestamps across camera switches."""
-    global current_ydl, current_feeder_ffmpeg, feeder_thread
-
-    ffmpeg_opts = config["ffmpeg"]
-    framerate = ffmpeg_opts.get("framerate", 30)
-
-    def _feed():
-        global current_ydl, current_feeder_ffmpeg
-        ydl_cmd = [
-            "yt-dlp",
-            "-f", "best",
-            "--hls-prefer-ffmpeg",
-            "-o", "-",
-            f"https://www.youtube.com/watch?v={youtube_id}",
-        ]
-
-        # Intermediate ffmpeg: remux to mpegts without re-encoding
-        # The persistent ffmpeg handles the actual encode
-        normalize_cmd = [
-            "ffmpeg",
-            "-i", "pipe:0",
-            "-c:v", "copy",
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
-            "-fflags", "+genpts",
-            "-reset_timestamps", "1",
-            "-f", "mpegts",
-            "pipe:1",
-        ]
-
-        try:
-            fifo_fd = os.open(fifo_path, os.O_WRONLY)
-        except OSError as e:
-            logger.error(f"Failed to open FIFO for writing: {e}")
-            return
-
-        try:
-            ydl_proc = subprocess.Popen(
-                ydl_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            norm_proc = subprocess.Popen(
-                normalize_cmd,
-                stdin=ydl_proc.stdout,
-                stdout=fifo_fd,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            # Allow yt-dlp to receive SIGPIPE if normalize proc exits
-            ydl_proc.stdout.close()
-
-            with feeder_lock:
-                current_ydl = ydl_proc
-                current_feeder_ffmpeg = norm_proc
-            norm_proc.wait()
-        except Exception as e:
-            logger.error(f"yt-dlp feeder error: {e}")
-        finally:
-            try:
-                os.close(fifo_fd)
-            except:
-                pass
-
-    feeder_thread = threading.Thread(target=_feed, daemon=True)
-    feeder_thread.start()
-    # Give yt-dlp + normalizer a moment to start
-    time.sleep(2)
-
-
-def stop_ydl_feeder():
-    """Stop the current yt-dlp feeder and its intermediate ffmpeg process."""
-    global current_ydl, current_feeder_ffmpeg
-    with feeder_lock:
-        ydl_proc = current_ydl
-        norm_proc = current_feeder_ffmpeg
-        current_ydl = None
-        current_feeder_ffmpeg = None
-
-    for proc in [ydl_proc, norm_proc]:
-        if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except:
-                try:
-                    proc.kill()
-                except:
-                    pass
-
-
 def stop_ffmpeg():
     """Stop the persistent ffmpeg process."""
     global ffmpeg_proc
     if ffmpeg_proc and ffmpeg_proc.poll() is None:
+        try:
+            ffmpeg_proc.stdin.close()
+        except:
+            pass
         try:
             ffmpeg_proc.terminate()
             ffmpeg_proc.wait(timeout=5)
@@ -372,7 +399,7 @@ def stop_ffmpeg():
 
 def stream_loop():
     """Main loop that cycles through cameras."""
-    global running, current_camera_index
+    global running, current_camera_index, current_camera_proc, buffer_thread
 
     switch_interval = config["stream"]["switch_interval"]
     cameras = config["cameras"]
@@ -383,8 +410,20 @@ def stream_loop():
     current_cam = get_current_camera()
     logger.info(f"Starting with camera: {current_cam['name']}")
 
-    # Start yt-dlp feeding into the FIFO -> ffmpeg reads from it
-    start_ydl_feeder(current_cam["youtube_id"])
+    # Start first camera
+    cam_proc = start_camera_feed(current_cam["youtube_id"])
+    if not cam_proc:
+        logger.error("Failed to start first camera")
+        running = False
+        return
+
+    with camera_lock:
+        current_camera_proc = cam_proc
+
+    # Start buffer thread
+    buffer_stop_event.clear()
+    buffer_thread = threading.Thread(target=buffer_writer, daemon=True)
+    buffer_thread.start()
 
     while running and not stop_event.is_set():
         # Wait for the switch interval
@@ -396,13 +435,14 @@ def stream_loop():
                 running = False
                 break
 
-            # Check if yt-dlp feeder or normalizer died (camera may be offline)
-            with feeder_lock:
-                ydl = current_ydl
-                norm = current_feeder_ffmpeg
-            if (ydl and ydl.poll() is not None) or (norm and norm.poll() is not None):
-                logger.warning("yt-dlp feeder ended (camera offline?), switching early...")
-                break
+            # Check if current camera died (offline)
+            with camera_lock:
+                cam = current_camera_proc
+            if cam:
+                ydl_proc, norm_proc = cam
+                if (ydl_proc.poll() is not None) or (norm_proc.poll() is not None):
+                    logger.warning("Camera feed ended (offline?), switching early...")
+                    break
 
             time.sleep(1)
             elapsed += 1
@@ -412,14 +452,59 @@ def stream_loop():
 
         # Switch to next camera
         next_cam = advance_camera()
+        logger.info(f"Starting transition to camera: {next_cam['name']} (stream will update in ~5 seconds)")
+
+        # Start new camera BEFORE stopping old one (seamless transition)
+        new_cam_proc = start_camera_feed(next_cam["youtube_id"])
+        if not new_cam_proc:
+            logger.error(f"Failed to start camera: {next_cam['name']}, keeping current")
+            continue
+
+        # Wait for new camera to actually produce data before swapping
+        # This prevents gaps in the stream
+        _, new_norm_proc = new_cam_proc
+        new_stdout = new_norm_proc.stdout
+        data_ready = False
+        wait_start = time.time()
+        max_wait = 10  # Max 10 seconds to start producing data
+
+        while time.time() - wait_start < max_wait and not stop_event.is_set():
+            ready, _, _ = select.select([new_stdout], [], [], 0.1)
+            if ready:
+                data_ready = True
+                break
+            time.sleep(0.1)
+
+        if not data_ready:
+            logger.warning(f"Camera {next_cam['name']} slow to start, switching anyway")
+
         logger.info(f"Switching to camera: {next_cam['name']}")
 
-        # Stop old feeder, start new one - ffmpeg keeps running
-        stop_ydl_feeder()
-        start_ydl_feeder(next_cam["youtube_id"])
+        # Atomically swap to new camera
+        old_cam_proc = None
+        with camera_lock:
+            old_cam_proc = current_camera_proc
+            current_camera_proc = new_cam_proc
+
+        # Stop old camera after swap
+        if old_cam_proc:
+            stop_camera_feed(old_cam_proc)
+
+        # Allow time for ffmpeg to process buffered data and start new camera
+        # HLS has inherent delay (segment_time * list_size + encoding buffer)
+        time.sleep(2)
+
+        logger.info(f"Switched to camera: {next_cam['name']} (new camera now visible)")
 
     # Cleanup
-    stop_ydl_feeder()
+    buffer_stop_event.set()
+    if buffer_thread:
+        buffer_thread.join(timeout=2)
+
+    with camera_lock:
+        if current_camera_proc:
+            stop_camera_feed(current_camera_proc)
+            current_camera_proc = None
 
     logger.info("Stream loop ended")
 
@@ -429,62 +514,70 @@ def signal_handler(signum, frame):
     logger.info("Received shutdown signal")
     running = False
     stop_event.set()
+    buffer_stop_event.set()
+
+
+def load_config():
+    """Load configuration from YAML file."""
+    global config
+    config_path = SCRIPT_DIR / CONFIG_FILE
+    if not config_path.exists():
+        logger.error(f"Config file not found: {config_path}")
+        sys.exit(1)
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    logger.info(f"Loaded config with {len(config['cameras'])} cameras")
+    logger.info(f"Switch interval: {config['stream']['switch_interval']} seconds")
+    logger.info(f"Preview mode: {config['stream'].get('preview_mode', True)}")
 
 
 def main():
     global running, hls_dir
 
     setup_logging()
+    load_config()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    logger.info("=" * 50)
-    logger.info("Live Stream Switcher")
-    logger.info("=" * 50)
+    # Create temp dir for HLS segments
+    temp_dir = tempfile.mkdtemp(prefix="livestream_")
+    hls_dir = temp_dir
+    logger.info(f"Using temp dir: {temp_dir}")
 
-    load_config()
-
+    # Start HLS preview server if enabled
     preview_mode = config["stream"].get("preview_mode", True)
-
     if preview_mode:
-        hls_dir = tempfile.mkdtemp(prefix="livestream_hls_")
-        logger.info(f"HLS segments directory: {hls_dir}")
-
-        server_thread = threading.Thread(target=start_http_server, daemon=True)
-        server_thread.start()
-        logger.info("HTTP preview server started at http://localhost:8080")
-
-    music_file = config["audio"].get("music_file", "")
-    if music_file:
-        if not os.path.isabs(music_file):
-            music_file = str(SCRIPT_DIR / music_file)
-        if not os.path.exists(music_file):
-            logger.warning(f"Music file not found: {music_file}")
-
-    # Create FIFO and start the single persistent ffmpeg
-    create_fifo()
+        http_port = config["stream"].get("http_port", 8080)
+        http_thread = threading.Thread(target=start_http_server, args=(http_port,), daemon=True)
+        http_thread.start()
 
     running = True
 
-    # Start ffmpeg in a background thread because it blocks until the FIFO
-    # is opened for writing (by the first yt-dlp feeder)
-    ffmpeg_thread = threading.Thread(target=start_ffmpeg, daemon=True)
-    ffmpeg_thread.start()
+    # Start ffmpeg
+    if not start_ffmpeg():
+        logger.error("Failed to start ffmpeg")
+        sys.exit(1)
+
+    # Give ffmpeg a moment to initialize
+    time.sleep(1)
 
     try:
         stream_loop()
-        ffmpeg_thread.join(timeout=2)
+    except Exception as e:
+        logger.error(f"Stream loop error: {e}")
     finally:
+        running = False
         stop_event.set()
+        buffer_stop_event.set()
         stop_ffmpeg()
-        # Clean up FIFO
-        if fifo_path:
-            try:
-                os.unlink(fifo_path)
-                os.rmdir(os.path.dirname(fifo_path))
-            except:
-                pass
+        if buffer_thread:
+            buffer_thread.join(timeout=2)
+        with camera_lock:
+            if current_camera_proc:
+                stop_camera_feed(current_camera_proc)
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
         logger.info("Streamer stopped")
 
 
