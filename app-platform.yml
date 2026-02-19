@@ -1,41 +1,45 @@
 name: webcam-streamer
 region: nyc
 
-# Add each stream as a separate service
+# Each stream is a separate service
 # Each service runs its own container with its own config
 
 services:
   # Stream 1: Ski Resort
   - name: stream-ski-resort
-    image:
-      registry_type: DO
-      repository: webcam-streamer
-      tag: latest
-    environment:
-      - STREAM_CONFIG=configs/streams/ski-resort.yaml
-      - YOUTUBE_KEY_SKI_RESORT=${YOUTUBE_KEY_SKI_RESORT}
+    github:
+      branch: master
+      repo: scott/webcam-streamer
+    build_command: pip install -r requirements.txt
+    run_command: python stream_manager.py --config configs/streams/ski-resort.yaml
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
-    routes:
-      - path: /
+    env:
+      - key: YOUTUBE_KEY_SKI_RESORT
+        type: SECRET
+        value: ${YOUTUBE_KEY_SKI_RESORT}
 
-  # Stream 2: Example (comment out or remove if not needed)
+  # Stream 2: Example (uncomment and configure to add more streams)
   # - name: stream-example
-  #   image:
-  #     registry_type: DO
-  #     repository: webcam-streamer
-  #     tag: latest
-  #   environment:
-  #     - STREAM_CONFIG=configs/streams/example.yaml
-  #     - YOUTUBE_KEY_EXAMPLE=${YOUTUBE_KEY_EXAMPLE}
+  #   github:
+  #     branch: master
+  #     repo: scott/webcam-streamer
+  #   build_command: pip install -r requirements.txt
+  #   run_command: python stream_manager.py --config configs/streams/example.yaml
   #   http_port: 8080
   #   instance_count: 1
   #   instance_size_slug: basic-xxs
+  #   env:
+  #     - key: YOUTUBE_KEY_EXAMPLE
+  #       type: SECRET
+  #       value: ${YOUTUBE_KEY_EXAMPLE}
 
 # How to add a new stream:
 # 1. Create config file: configs/streams/new-stream.yaml
 # 2. Add environment variable in DO dashboard: YOUTUBE_KEY_NEWSTREAM
-# 3. Add a new service block above (copy stream-ski-resort as template)
-# 4. Change name, STREAM_CONFIG, and YOUTUBE_KEY_* to match your new stream
-# 5. Redeploy the app
+# 3. Copy a service block above and modify:
+#    - name: stream-new-stream
+#    - run_command: --config configs/streams/new-stream.yaml
+#    - env key: YOUTUBE_KEY_NEWSTREAM
+# 4. Redeploy
