@@ -10,11 +10,12 @@ services:
     github:
       branch: master
       repo: scott/webcam-streamer
-    build_command: pip install -r requirements.txt
+    dockerfile_path: Dockerfile
+    source_dir: /
     run_command: python stream_manager.py --config configs/streams/ski-resort.yaml
     http_port: 8080
     instance_count: 1
-    instance_size_slug: basic-xxs
+    instance_size_slug: basic-s
     health_check:
       path: /health
       port: 8080
@@ -22,10 +23,13 @@ services:
       period_seconds: 5
       timeout_seconds: 3
       failure_threshold: 10
-    env:
+    envs:
       - key: YOUTUBE_KEY_SKI_RESORT
         type: SECRET
         value: ${YOUTUBE_KEY_SKI_RESORT}
+      - key: YOUTUBE_API_KEY
+        type: SECRET
+        value: ${YOUTUBE_API_KEY}
 
   # Stream 2: Example (uncomment and configure to add more streams)
   # - name: stream-example

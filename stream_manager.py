@@ -277,21 +277,46 @@ def advance_camera():
     return get_current_camera()
 
 
-def start_camera_feed(youtube_id):
-    """Start a camera feed (yt-dlp + ffmpeg normalizer) and return the output pipe."""
+def start_camera_feed(camera):
+    """Start a camera feed and return the output pipe.
+    
+    Accepts either:
+    - camera with 'stream_url': use ffmpeg directly on the HLS URL
+    - camera with 'youtube_id': use yt-dlp to get stream (fallback)
+    """
     ffmpeg_opts = config["ffmpeg"]
     video_bitrate = ffmpeg_opts.get("video_bitrate", "6800k")
     audio_bitrate = ffmpeg_opts.get("audio_bitrate", "128k")
     resolution = ffmpeg_opts.get("resolution", "1920x1080")
     framerate = ffmpeg_opts.get("framerate", 30)
 
-    ydl_cmd = [
-        "yt-dlp",
-        "-f", "best",
-        "--hls-prefer-ffmpeg",
-        "-o", "-",
-        f"https://www.youtube.com/watch?v={youtube_id}",
-    ]
+    stream_url = camera.get("stream_url")
+    youtube_id = camera.get("youtube_id")
+    youtube_api_key = os.environ.get("YOUTUBE_API_KEY")
+
+    if stream_url:
+        source_cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "warning",
+            "-i", stream_url,
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ]
+    elif youtube_id:
+        ydl_cmd = [
+            "yt-dlp",
+            "-f", "best",
+            "--hls-prefer-ffmpeg",
+            "-o", "-",
+        ]
+        if youtube_api_key:
+            ydl_cmd.extend(["--extractor-args", f"youtube:api_key={youtube_api_key}"])
+        ydl_cmd.append(f"https://www.youtube.com/watch?v={youtube_id}")
+        source_cmd = ydl_cmd
+    else:
+        logger.error("Camera config must have either stream_url or youtube_id")
+        return None
 
     normalize_cmd = [
         "ffmpeg",
@@ -311,22 +336,38 @@ def start_camera_feed(youtube_id):
     ]
 
     try:
-        ydl_proc = subprocess.Popen(
-            ydl_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        norm_proc = subprocess.Popen(
-            normalize_cmd,
-            stdin=ydl_proc.stdout,
-            stdout=subprocess.PIPE,  # Output to pipe that we'll read from
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        # Close yt-dlp's stdout in parent so normalizer gets EOF when it dies
-        ydl_proc.stdout.close()
-        return (ydl_proc, norm_proc)
+        if stream_url:
+            source_proc = subprocess.Popen(
+                source_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            norm_proc = subprocess.Popen(
+                normalize_cmd,
+                stdin=source_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            source_proc.stdout.close()
+            return (source_proc, norm_proc)
+        else:
+            ydl_proc = subprocess.Popen(
+                source_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            norm_proc = subprocess.Popen(
+                normalize_cmd,
+                stdin=ydl_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            ydl_proc.stdout.close()
+            return (ydl_proc, norm_proc)
     except Exception as e:
         logger.error(f"Failed to start camera feed: {e}")
         return None
@@ -515,7 +556,7 @@ def stream_loop():
     logger.info(f"Starting with camera: {current_cam['name']}")
 
     # Start first camera
-    cam_proc = start_camera_feed(current_cam["youtube_id"])
+    cam_proc = start_camera_feed(current_cam)
     if not cam_proc:
         logger.error("Failed to start first camera")
         running = False
@@ -559,7 +600,7 @@ def stream_loop():
         logger.info(f"Starting transition to camera: {next_cam['name']} (stream will update in ~5 seconds)")
 
         # Start new camera BEFORE stopping old one (seamless transition)
-        new_cam_proc = start_camera_feed(next_cam["youtube_id"])
+        new_cam_proc = start_camera_feed(next_cam)
         if not new_cam_proc:
             logger.error(f"Failed to start camera: {next_cam['name']}, keeping current")
             continue
