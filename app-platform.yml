@@ -15,6 +15,13 @@ services:
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
+    health_check:
+      path: /health
+      port: 8080
+      initial_delay_seconds: 10
+      period_seconds: 5
+      timeout_seconds: 3
+      failure_threshold: 10
     env:
       - key: YOUTUBE_KEY_SKI_RESORT
         type: SECRET
