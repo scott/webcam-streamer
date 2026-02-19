@@ -335,6 +335,12 @@ def start_camera_feed(camera):
         "pipe:1",
     ]
 
+    def log_stderr(proc, name):
+        def reader():
+            for line in proc.stderr:
+                logger.debug(f"{name}: {line.decode().strip()}")
+        return reader
+
     try:
         if stream_url:
             source_proc = subprocess.Popen(
@@ -343,6 +349,8 @@ def start_camera_feed(camera):
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            stderr_thread = threading.Thread(target=log_stderr(source_proc, "ffmpeg-source"), daemon=True)
+            stderr_thread.start()
             norm_proc = subprocess.Popen(
                 normalize_cmd,
                 stdin=source_proc.stdout,
@@ -359,6 +367,8 @@ def start_camera_feed(camera):
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            stderr_thread = threading.Thread(target=log_stderr(ydl_proc, "yt-dlp"), daemon=True)
+            stderr_thread.start()
             norm_proc = subprocess.Popen(
                 normalize_cmd,
                 stdin=ydl_proc.stdout,
@@ -585,8 +595,10 @@ def stream_loop():
                 cam = current_camera_proc
             if cam:
                 ydl_proc, norm_proc = cam
-                if (ydl_proc.poll() is not None) or (norm_proc.poll() is not None):
-                    logger.warning("Camera feed ended (offline?), switching early...")
+                ydl_exit = ydl_proc.poll()
+                norm_exit = norm_proc.poll()
+                if ydl_exit is not None or norm_exit is not None:
+                    logger.warning(f"Camera feed ended (offline?), switching early... ydl_exit={ydl_exit}, norm_exit={norm_exit}")
                     break
 
             time.sleep(1)
