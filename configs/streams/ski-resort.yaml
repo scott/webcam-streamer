@@ -4,7 +4,7 @@ name: "Ski Resort Stream"
 
 stream:
   switch_interval: 15
-  preview_mode: false
+  preview_mode: true
   youtube:
     rtmp_url: "rtmps://a.rtmp.youtube.com/live2"
 
