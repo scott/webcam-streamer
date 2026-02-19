@@ -510,15 +510,16 @@ def start_ffmpeg():
             "-hls_segment_filename", os.path.join(hls_dir, "seg%05d.ts"),
             os.path.join(hls_dir, "stream.m3u8"),
         ])
-    else:
-        rtmp_url = stream_opts.get("youtube", {}).get("rtmp_url", "")
-        stream_key = stream_opts.get("youtube", {}).get("stream_key", "")
-        if not stream_key:
-            logger.error("No stream key configured!")
-            return False
+    
+    rtmp_url = stream_opts.get("youtube", {}).get("rtmp_url", "")
+    stream_key = stream_opts.get("youtube", {}).get("stream_key", "")
+    if stream_key:
         ffmpeg_cmd.extend(["-f", "flv", f"{rtmp_url}/{stream_key}"])
+    elif not preview_mode:
+        logger.error("No stream key configured!")
+        return False
 
-    logger.info(f"Starting persistent ffmpeg ({'HLS preview' if preview_mode else 'YouTube RTMP'})")
+    logger.info(f"Starting persistent ffmpeg (HLS preview: {preview_mode}, YouTube RTMP: {bool(stream_key)})")
 
     ffmpeg_proc = subprocess.Popen(
         ffmpeg_cmd,
