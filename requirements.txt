@@ -2,6 +2,7 @@
 
 # Core
 PyYAML>=6.0
+python-dotenv>=1.0.0
 
 # YouTube stream extraction
 yt-dlp[curl]>=2024.12.23
