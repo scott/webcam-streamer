@@ -1,0 +1,15 @@
+[Unit]
+Description=Webcam Streamer
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/app
+Environment="PATH=/app/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/app/venv/bin/python stream_manager.py --config configs/streams/ski-resort.yaml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
