@@ -312,6 +312,16 @@ def start_camera_feed(camera):
         ]
         if youtube_api_key:
             ydl_cmd.extend(["--extractor-args", f"youtube:api_key={youtube_api_key}"])
+        
+        # Use YouTube cookies if available (to bypass bot detection on cloud IPs)
+        youtube_cookies = os.environ.get("YOUTUBE_COOKIES")
+        if youtube_cookies:
+            import tempfile
+            cookie_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            cookie_file.write(youtube_cookies)
+            cookie_file.close()
+            ydl_cmd.extend(["--cookies", cookie_file.name])
+        
         ydl_cmd.append(f"https://www.youtube.com/watch?v={youtube_id}")
         source_cmd = ydl_cmd
     else:

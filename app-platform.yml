@@ -30,6 +30,9 @@ services:
       - key: YOUTUBE_API_KEY
         type: SECRET
         value: ${YOUTUBE_API_KEY}
+      - key: YOUTUBE_COOKIES
+        type: SECRET
+        value: ${YOUTUBE_COOKIES}
 
   # Stream 2: Example (uncomment and configure to add more streams)
   # - name: stream-example
