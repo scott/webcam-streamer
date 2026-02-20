@@ -338,7 +338,7 @@ def start_camera_feed(camera):
     def log_stderr(proc, name):
         def reader():
             for line in proc.stderr:
-                logger.debug(f"{name}: {line.decode().strip()}")
+                logger.warning(f"{name}: {line.decode().strip()}")
         return reader
 
     try:
@@ -478,7 +478,7 @@ def start_ffmpeg():
 
     ffmpeg_cmd = [
         "ffmpeg",
-        "-hide_banner", "-loglevel", "error",
+        "-hide_banner", "-loglevel", "warning",
         "-nostdin",
         "-fflags", "+genpts+igndts+discardcorrupt+nobuffer",
         "-flags", "+low_delay",
