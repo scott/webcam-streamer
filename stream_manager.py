@@ -500,24 +500,37 @@ def start_ffmpeg():
         "-c:a", "aac", "-b:a", audio_bitrate,
     ])
 
-    if preview_mode:
-        ffmpeg_cmd.extend([
-            "-f", "hls",
-            "-hls_time", "1",
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments+omit_endlist",
-            "-hls_segment_type", "mpegts",
-            "-hls_segment_filename", os.path.join(hls_dir, "seg%05d.ts"),
-            os.path.join(hls_dir, "stream.m3u8"),
-        ])
-    
     rtmp_url = stream_opts.get("youtube", {}).get("rtmp_url", "")
     stream_key = stream_opts.get("youtube", {}).get("stream_key", "")
+    
+    outputs = []
+    
+    if preview_mode:
+        outputs.append(f"hls://{os.path.join(hls_dir, 'stream.m3u8')}")
+    
     if stream_key:
-        ffmpeg_cmd.extend(["-f", "flv", f"{rtmp_url}/{stream_key}"])
-    elif not preview_mode:
-        logger.error("No stream key configured!")
+        outputs.append(f"flv://{rtmp_url}/{stream_key}")
+    
+    if not outputs:
+        logger.error("No output configured! Set preview_mode: true or configure stream_key")
         return False
+    
+    if len(outputs) > 1:
+        tee_output = "|".join(outputs)
+        ffmpeg_cmd.extend(["-f", "tee", tee_output])
+    else:
+        if preview_mode:
+            ffmpeg_cmd.extend([
+                "-f", "hls",
+                "-hls_time", "1",
+                "-hls_list_size", "5",
+                "-hls_flags", "delete_segments+omit_endlist",
+                "-hls_segment_type", "mpegts",
+                "-hls_segment_filename", os.path.join(hls_dir, "seg%05d.ts"),
+                os.path.join(hls_dir, "stream.m3u8"),
+            ])
+        else:
+            ffmpeg_cmd.extend(["-f", "flv", f"{rtmp_url}/{stream_key}"])
 
     logger.info(f"Starting persistent ffmpeg (HLS preview: {preview_mode}, YouTube RTMP: {bool(stream_key)})")
 
