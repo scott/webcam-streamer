@@ -157,7 +157,7 @@ def load_config(stream_config_path, base_config_path=None):
             # Remove the _env key after use
             youtube_opts.pop('stream_key_env', None)
         else:
-            logger.warning(f"No stream key found for {stream_name}. "
+            logger.warning(f"No stream key found. "
                           f"Expected env var {env_var} to be set.")
     
     # Expand any ${VAR} patterns in config
