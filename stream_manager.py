@@ -32,8 +32,12 @@ import yaml
 import yt_dlp
 import colorlog
 from colorlog import ColoredFormatter
+from dotenv import load_dotenv
 
 SCRIPT_DIR = Path(__file__).parent
+
+# Load environment variables from .env file
+load_dotenv(SCRIPT_DIR / ".env")
 
 logger = None
 config = None
