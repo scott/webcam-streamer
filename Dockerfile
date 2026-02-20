@@ -26,7 +26,7 @@ COPY music ./music
 RUN mkdir -p /app/stream_buffers && \
     chmod +x stream_processor.sh
 
-ENV PATH="/root/.local/bin:${PATH}"
+ENV PATH="/root/.local/bin:/usr/local/bin:${PATH}"
 
 # Default CMD - requires --config argument
 CMD ["python", "stream_manager.py", "--config", "configs/streams/ski-resort.yaml"]
