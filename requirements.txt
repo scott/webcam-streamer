@@ -4,7 +4,7 @@
 PyYAML>=6.0
 
 # YouTube stream extraction
-yt-dlp>=2024.12.23
+yt-dlp[curl]>=2024.12.23
 
 # Logging
 colorlog>=2.2.0
